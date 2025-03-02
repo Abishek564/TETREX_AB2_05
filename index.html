@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Tracking - Ransomware Monitoring</title>
+  <style>
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f4f8; margin: 0; padding: 0; }
+    header {
+      background: linear-gradient(135deg, #1565c0, #1e88e5);
+      color: #fff;
+      padding: 1.5rem;
+      text-align: center;
+    }
+    header h1 { font-size: 2.5rem; }
+    nav {
+      background: #1e88e5;
+      padding: 0.8rem;
+      text-align: center;
+    }
+    nav a {
+      color: #fff;
+      text-decoration: none;
+      margin: 0 1rem;
+      font-size: 1.1rem;
+      transition: color 0.3s;
+    }
+    nav a:hover { color: #bbdefb; }
+    .container {
+      max-width: 1000px;
+      margin: 2rem auto;
+      padding: 1rem;
+    }
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .card h2 { color: #1565c0; margin-bottom: 1rem; }
+    pre {
+      background: #f7f9fc;
+      padding: 1rem;
+      border-radius: 4px;
+      overflow-x: auto;
+      overflow-y: auto;
+      max-height: 300px; /* Added max height for scrolling */
+      font-size: 0.95rem;
+      white-space: pre-wrap;
+    }
+    footer { text-align: center; padding: 1rem 0; color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="live_tracking.html">Live Tracking</a>
+    <a href="system_data.html">System Data</a>
+  </nav>
+
+  <header>
+    <h1>Live Tracking Dashboard</h1>
+    <p>Real-time system features and log output</p>
+  </header>
+
+  <div class="container">
+    <div class="card">
+      <h2>System Feature Data</h2>
+      <pre id="liveData">Waiting for live tracking data...</pre>
+    </div>
+    <div class="card">
+      <h2>Log Output</h2>
+      <pre id="logData">Waiting for log messages...</pre>
+    </div>
+  </div>
+
+  <footer>
+    &copy; 2025 Advanced Ransomware Monitoring Software
+  </footer>
+
+  <script>
+    const wsUrl = "ws://127.0.0.1:8001/ws/alerts?token=mysecrettoken";
+    const socket = new WebSocket(wsUrl);
+
+    socket.onopen = () => {
+      console.log("Connected to WebSocket at", wsUrl);
+    };
+
+    socket.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.type === "live_tracking") {
+        document.getElementById("liveData").innerText = JSON.stringify(msg.data, null, 2);
+      } else if (msg.type === "live_tracking_log") {
+        const logElem = document.getElementById("logData");
+        logElem.innerText += msg.log + "\n";
+      } else if (msg.type === "alert") {
+        alert("ALERT: " + msg.alert);
+      }
+    };
+
+    socket.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    socket.onclose = () => {
+      console.log("WebSocket connection closed.");
+    };
+  </script>
+</body>
+</html>
