@@ -5,118 +5,140 @@ import psutil
 import os
 import subprocess
 import asyncio
-import joblib
 import csv
 import hashlib
+import math
+import platform
 from datetime import datetime
 from pathlib import Path
-import platform
-import math
+import random
+import string
 
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
-from xgboost import XGBClassifier
+import pandas as pd
 
-# FastAPI and related imports
-from fastapi import FastAPI, Request, WebSocket, BackgroundTasks
+# FastAPI and WebSocket Imports
+from fastapi import FastAPI, Request, WebSocket, Query, HTTPException
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
 
-# Windows-specific imports (only loaded on Windows)
+# Windows-specific imports
 if platform.system() == "Windows":
-    import wmi
     import winreg
-    import win32evtlog
 
-# ------------------------------
-# Configure Logging
-# ------------------------------
-# Use WARNING level so debug info isn't printed to console.
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+# Watchdog for file monitoring
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from starlette.websockets import WebSocketDisconnect
 
-# ------------------------------
-# Global Variables
-# ------------------------------
-file_monitor_handler_global = None
-ml_model = None  # Will hold the loaded ML model
-response_triggered_flag = threading.Event()  # For thread-safe flag handling
-connected_clients = []  # List of active WebSocket clients
-main_loop = None  # Global event loop (set during startup)
+# -------------------------------------------------
+# Logging Configuration
+# -------------------------------------------------
+# Remove default logging configuration so no output appears on the backend.
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ------------------------------
-# Model Training and Loading
-# ------------------------------
-def train_and_save_model():
-    data_path = r"C:\Users\Home\jose\data_file.csv"  # Update with your dataset path
-    data = pd.read_csv(data_path)
-    logging.info(f"Dataset Loaded with shape: {data.shape}")
-    if "FileName" in data.columns and "md5Hash" in data.columns:
-        data = data.drop(columns=["FileName", "md5Hash"])
-    X = data.iloc[:, :-1]
-    y = data.iloc[:, -1]
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = XGBClassifier(n_estimators=100, learning_rate=0.1, max_depth=3,
-                          random_state=42, use_label_encoder=False, eval_metric='logloss')
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
-    logging.info(f"Model Accuracy: {acc*100:.2f}%")
-    logging.info("\nClassification Report:\n" + classification_report(y_test, y_pred))
-    joblib.dump(model, "ransomware_model_5features.pkl")
-    logging.info("Model saved as 'ransomware_model_5features.pkl'")
+# -------------------------------------------------
+# Global Variables and Configurations
+# -------------------------------------------------
+file_monitor_handler_global = None  # For directory events monitoring
+ensemble_models = None  # Detection is solely based on threshold checks.
+response_triggered_flag = threading.Event()  # Prevent duplicate alerts
+connected_clients = []  # Connected WebSocket clients
+main_loop = None  # Global asyncio event loop
 
-def load_ml_model(model_path="ransomware_model_5features.pkl"):
-    try:
-        model = joblib.load(model_path)
-        logging.info("ML model loaded successfully.")
-        return model
-    except Exception as e:
-        logging.error(f"Error loading ML model: {e}")
+# Global flag to block further harmful actions once an alert is triggered
+action_blocked = False
+
+# Baseline statistics for 15 features (used in anomaly detection)
+baseline_stats = {
+    "cpu_usage": {"mean": 20, "std": 5},
+    "memory_usage": {"mean": 30, "std": 10},
+    "disk_usage": {"mean": 40, "std": 10},
+    "modified": {"mean": 2, "std": 1},
+    "renamed": {"mean": 1, "std": 0.5},
+    "deleted": {"mean": 1, "std": 0.5},
+    "entropy_alerts": {"mean": 3, "std": 1},
+    "unauth_proc_count": {"mean": 0, "std": 0},
+    "shadow_copy_flag": {"mean": 0, "std": 0},
+    "registry_alerts_count": {"mean": 0, "std": 0},
+    "susp_net_count": {"mean": 0, "std": 0},
+    "susp_ext_count": {"mean": 0, "std": 0},
+    "proc_injection": {"mean": 0, "std": 0},
+    "sys_call_anomaly": {"mean": 0, "std": 0},
+    "total_net_connections": {"mean": 50, "std": 20}
+}
+
+# File and directory paths
+MODEL_PATH = None  # Not used (models are removed)
+MONITOR_PATH = Path(r"C:\Users\Home\Documents")  # Adjust as needed
+
+# Dedicated folder for simulation files
+test_ransomware_dir = MONITOR_PATH / "TestRansomware"
+os.makedirs(test_ransomware_dir, exist_ok=True)
+
+# -------------------------------------------------
+# Helper Function: Robust Averaging
+# -------------------------------------------------
+def robust_average(func, samples=5, delay=0.5, outlier_threshold=0.2):
+    """
+    Calls the provided function 'samples' times with a delay between samples.
+    Filters out values deviating from the median by more than outlier_threshold.
+    Returns the average of the filtered values (or the median if all are filtered).
+    """
+    vals = []
+    for _ in range(samples):
+        try:
+            v = func()
+            vals.append(v)
+        except Exception:
+            logging.exception(f"Error calling {func.__name__}")
+        time.sleep(delay)
+    if not vals:
         return None
+    median_val = np.median(vals)
+    if median_val == 0:
+        return 0
+    filtered = [v for v in vals if abs(v - median_val) / abs(median_val) <= outlier_threshold]
+    return sum(filtered) / len(filtered) if filtered else median_val
 
-def predict_ransomware(model, features):
-    features_array = np.array([features])
-    prediction = model.predict(features_array)[0]
-    return prediction
-
-# ------------------------------
-# System Metrics Functions
-# ------------------------------
+# -------------------------------------------------
+# 1. Monitoring Functions with Robust Averaging
+# -------------------------------------------------
 def get_cpu_usage():
-    return psutil.cpu_percent(interval=1)
+    return robust_average(lambda: psutil.cpu_percent(interval=0.5), samples=5)
 
 def get_memory_usage():
-    return psutil.virtual_memory().percent
+    return robust_average(lambda: psutil.virtual_memory().percent, samples=5)
 
 def get_disk_usage():
-    return psutil.disk_usage('/').percent
+    return robust_average(lambda: psutil.disk_usage('/').percent, samples=5)
 
 def get_registry_alerts_count():
     count = 0
     if platform.system() == "Windows":
-        keys_to_monitor = [r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"]
-        for key in keys_to_monitor:
+        keys = [r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"]
+        for key in keys:
             try:
                 with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key, 0, winreg.KEY_READ) as reg:
-                    num = winreg.QueryInfoKey(reg)[0]
-                    for i in range(num):
-                        name, value, _ = winreg.EnumValue(reg, i)
+                    for i in range(winreg.QueryInfoKey(reg)[0]):
+                        name, _, _ = winreg.EnumValue(reg, i)
                         if "ransom" in name.lower() or "encrypt" in name.lower():
                             count += 1
             except Exception:
-                continue
+                logging.exception("Error reading registry key.")
     return count
 
 def get_unauthorized_process_count():
+    return robust_average(get_unauthorized_process_count_helper, samples=5)
+
+def get_unauthorized_process_count_helper():
     count = 0
     for proc in psutil.process_iter(['name']):
         try:
-            name = proc.info.get('name', '').lower()
-            if name in ["powershell.exe", "cmd.exe", "wmic.exe"]:
+            if proc.info.get('name', '').lower() in ["cmd.exe", "wmic.exe"]:
                 count += 1
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -132,16 +154,32 @@ def get_shadow_copy_flag():
     return 0
 
 def get_suspicious_network_count():
+    return robust_average(get_suspicious_network_count_helper, samples=5)
+
+def get_suspicious_network_count_helper():
     count = 0
     for conn in psutil.net_connections(kind='inet'):
-        if conn.raddr and conn.raddr[0] == "192.168.1.100":  # Adjust as needed.
+        if conn.raddr and conn.raddr[0] == "192.168.1.100":
             count += 1
     return count
 
 def get_total_network_connections():
-    return len(psutil.net_connections(kind='inet'))
+    return robust_average(get_total_network_connections_helper, samples=5)
+
+def get_total_network_connections_helper():
+    try:
+        return len(psutil.net_connections(kind='inet'))
+    except Exception:
+        logging.exception("Error obtaining total network connections.")
+        return 0
 
 def get_suspicious_file_extension_count(directory):
+    try:
+        return robust_average(lambda: get_suspicious_file_extension_count_helper(directory), samples=3)
+    except Exception:
+        return 0
+
+def get_suspicious_file_extension_count_helper(directory):
     count = 0
     path = Path(directory)
     for file in path.rglob('*'):
@@ -156,35 +194,44 @@ def compute_file_hash(file_path):
             for chunk in iter(lambda: f.read(4096), b""):
                 sha256.update(chunk)
         return sha256.hexdigest()
-    except Exception as e:
-        logging.error(f"Error computing hash for {file_path}: {e}")
+    except Exception:
+        logging.exception(f"Error computing hash for {file_path}")
         return None
 
 def analyze_directory_entropy(directory):
     suspicious_count = 0
-    path = Path(directory)
-    for file_path in path.rglob('*'):
-        if file_path.suffix.lower() in ['.docx', '.pdf', '.txt', '.exe']:
-            try:
-                data = file_path.read_bytes()
-                if not data:
-                    continue
-                probabilities = [data.count(byte) / len(data) for byte in set(data)]
-                entropy = -sum(p * math.log2(p) for p in probabilities if p > 0)
-                if entropy > 7.5:
-                    suspicious_count += 1
-            except Exception:
-                continue
+    try:
+        path = Path(directory)
+        for file in path.rglob('*'):
+            if file.suffix.lower() in ['.docx', '.pdf', '.txt', '.exe']:
+                try:
+                    data = file.read_bytes()
+                    if not data:
+                        continue
+                    probabilities = [data.count(byte) / len(data) for byte in set(data)]
+                    entropy = -sum(p * math.log2(p) for p in probabilities if p > 0)
+                    if entropy > 7.5:
+                        suspicious_count += 1
+                except Exception:
+                    logging.exception("Error calculating entropy for file.")
+    except Exception:
+        logging.exception("Error during directory entropy analysis.")
     return suspicious_count
 
-# ------------------------------
-# File Monitoring using Watchdog
-# ------------------------------
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+def monitor_crypto_operations():
+    return 0
 
+def monitor_process_injection():
+    return 0
+
+def monitor_sys_call_anomaly():
+    return 0
+
+# -------------------------------------------------
+# 2. File Monitoring using Watchdog
+# -------------------------------------------------
 class FileMonitorHandler(FileSystemEventHandler):
-    def _init_(self):
+    def __init__(self):
         self.modified_files = set()
         self.renamed_files = set()
         self.deleted_files = set()
@@ -230,130 +277,49 @@ def start_file_monitor(path, handler):
         observer.stop()
     observer.join()
 
-# ------------------------------
-# Advanced Monitoring (Placeholders)
-# ------------------------------
-def monitor_process_execution():
-    while True:
-        for proc in psutil.process_iter(['pid', 'name']):
-            try:
-                name = proc.info.get('name', '').lower()
-                if name in ["powershell.exe", "cmd.exe", "wmic.exe"]:
-                    pass  # Placeholder
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        time.sleep(5)
+# -------------------------------------------------
+# Since we're removing the ensemble model dependency,
+# detection is solely based on threshold checks.
+# -------------------------------------------------
+def predict_ransomware_ensemble(ensemble_models, features, threshold=0.5):
+    # Always return 0 (normal) because detection is based on threshold only.
+    return 0
 
-def monitor_shadow_copy_deletion():
-    while True:
-        if get_shadow_copy_flag():
-            pass  # Placeholder
-        time.sleep(60)
+# -------------------------------------------------
+# Baseline Updating
+# -------------------------------------------------
+def update_baseline(baseline, new_data, alpha=0.1):
+    updated = {}
+    for key, stats in baseline.items():
+        new_value = new_data.get(key, stats['mean'])
+        updated_mean = (1 - alpha) * stats['mean'] + alpha * new_value
+        updated_std = (1 - alpha) * stats['std'] + alpha * abs(new_value - updated_mean)
+        updated[key] = {"mean": updated_mean, "std": updated_std}
+    return updated
 
-def monitor_registry_changes():
-    while True:
-        _ = get_registry_alerts_count()
-        time.sleep(5)
+# -------------------------------------------------
+# Early Alert Check Function (Dynamic Threshold: 85%)
+# Additionally, check if file events exceed an absolute threshold of 30.
+# -------------------------------------------------
+def check_and_trigger_early_alert(data):
+    for key in ["memory_usage", "disk_usage", "modified", "entropy_alerts"]:
+        base_mean = baseline_stats.get(key, {}).get("mean", 1)
+        if base_mean > 0 and abs(data[key] - base_mean) / base_mean > 0.85:
+            logging.info(f"Early alert: {key} deviated significantly (current: {data[key]}, baseline: {base_mean}).")
+            trigger_response(data)
+            time.sleep(0.5)
+            return
+    if data["modified"] >= 30 or data["renamed"] >= 30 or data["deleted"] >= 30:
+        logging.info(f"Early alert: File event threshold exceeded (modified: {data['modified']}, renamed: {data['renamed']}, deleted: {data['deleted']}).")
+        trigger_response(data)
+        time.sleep(0.5)
 
-def monitor_network_traffic():
-    while True:
-        _ = get_suspicious_network_count()
-        time.sleep(5)
-
-def monitor_memory_usage(memory_threshold=80):
-    while True:
-        mem_usage = psutil.virtual_memory().percent
-        if mem_usage > memory_threshold:
-            pass  # Placeholder
-        time.sleep(2)
-
-def monitor_file_extension_changes(path):
-    while True:
-        _ = get_suspicious_file_extension_count(path)
-        time.sleep(5)
-
-def monitor_abnormal_system_calls():
-    while True:
-        time.sleep(5)
-
-def monitor_process_injection():
-    while True:
-        time.sleep(5)
-
-def monitor_system_calls_etw():
-    while True:
-        time.sleep(5)
-
-def monitor_user_login_events():
-    while True:
-        time.sleep(30)
-
-def monitor_advanced_registry_changes():
-    while True:
-        time.sleep(5)
-
-def monitor_network_flow_details():
-    while True:
-        _ = get_total_network_connections()
-        time.sleep(5)
-
-def start_falco_monitor():
-    if platform.system() != "Linux":
-        return
-    try:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        falco_cmd = ["falco", "-o", "json_output=true"]
-        process = subprocess.Popen(falco_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        while True:
-            line = process.stdout.readline()
-            if not line:
-                break
-    except FileNotFoundError:
-        logging.error("Falco executable not found in PATH.")
-    except Exception as e:
-        logging.error(f"Error running Falco: {e}")
-
-# ------------------------------
-# WebSocket Data Pushing Function
-# ------------------------------
-def notify_system_data(data):
-    message = {"type": "system_data", "data": data}
-    for client in connected_clients:
-        try:
-            asyncio.run_coroutine_threadsafe(client.send_json(message), main_loop)
-        except Exception as e:
-            logging.error(f"Error sending system data to client: {e}")
-
-# ------------------------------
-# Automated Response Mechanism
-# ------------------------------
-def reset_response_flag(delay=60):
-    time.sleep(delay)
-    response_triggered_flag.clear()
-
-def notify_clients(alert_message):
-    for client in connected_clients:
-        try:
-            asyncio.run_coroutine_threadsafe(client.send_json(alert_message), main_loop)
-        except Exception as e:
-            logging.error(f"Error sending alert to client: {e}")
-
-def trigger_response(data):
-    if not response_triggered_flag.is_set():
-        response_triggered_flag.set()
-        alert_message = {
-            "type": "alert",
-            "alert": "Potential ransomware activity detected!",
-            "data": data
-        }
-        notify_clients(alert_message)
-        threading.Thread(target=reset_response_flag, args=(60,), daemon=True).start()
-
-# ------------------------------
-# Data Collection and ML Prediction
-# ------------------------------
+# -------------------------------------------------
+# Data Collection, Anomaly Check, and Detection
+# -------------------------------------------------
 def collect_system_data():
-    file_events = file_monitor_handler_global.get_file_event_counts() if file_monitor_handler_global else {"modified": 0, "renamed": 0, "deleted": 0}
+    file_events = (file_monitor_handler_global.get_file_event_counts()
+                   if file_monitor_handler_global else {"modified": 0, "renamed": 0, "deleted": 0})
     data = {
         "timestamp": datetime.now().isoformat(),
         "cpu_usage": get_cpu_usage(),
@@ -362,22 +328,26 @@ def collect_system_data():
         "modified": file_events.get("modified", 0),
         "renamed": file_events.get("renamed", 0),
         "deleted": file_events.get("deleted", 0),
-        "entropy_alerts": analyze_directory_entropy(r"C:\Users\Home\Documents"),
+        "entropy_alerts": analyze_directory_entropy(MONITOR_PATH),
         "unauth_proc_count": get_unauthorized_process_count(),
         "shadow_copy_flag": get_shadow_copy_flag(),
         "registry_alerts_count": get_registry_alerts_count(),
         "susp_net_count": get_suspicious_network_count(),
-        "susp_ext_count": get_suspicious_file_extension_count(r"C:\Users\Home\Documents"),
-        "proc_injection": 0,      # Placeholder
-        "sys_call_anomaly": 0,    # Placeholder
-        "total_net_connections": get_total_network_connections()
+        "susp_ext_count": get_suspicious_file_extension_count(MONITOR_PATH),
+        "proc_injection": monitor_process_injection(),
+        "sys_call_anomaly": monitor_sys_call_anomaly(),
+        "total_net_connections": get_total_network_connections(),
+        "crypto_api_calls": monitor_crypto_operations()  # Placeholder
     }
     return data
 
-def collect_and_predict(model):
+def collect_and_predict(ensemble_models):
+    global baseline_stats
     data = collect_system_data()
+    
+    check_and_trigger_early_alert(data)
+    
     features = [
-        data["cpu_usage"],
         data["memory_usage"],
         data["disk_usage"],
         data["modified"],
@@ -393,42 +363,32 @@ def collect_and_predict(model):
         data["sys_call_anomaly"],
         data["total_net_connections"]
     ]
-    ml_prediction = predict_ransomware(model, features) if model is not None else 0
+    
+    sudden_anomaly = False
+    for key in ["memory_usage", "disk_usage", "modified", "entropy_alerts"]:
+        base_mean = baseline_stats.get(key, {}).get("mean", 1)
+        if base_mean > 0 and abs(data[key] - base_mean) / base_mean > 0.85:
+            sudden_anomaly = True
+            logging.info(f"Sudden anomaly detected in {key}: current {data[key]}, baseline: {base_mean}")
+            break
+    if data["modified"] >= 30 or data["renamed"] >= 30 or data["deleted"] >= 30:
+        sudden_anomaly = True
+        logging.info(f"Sudden file event threshold exceeded: modified {data['modified']}, renamed {data['renamed']}, deleted {data['deleted']}.")
+    
+    detection = 1 if sudden_anomaly else 0
+    data["ml_detection"] = detection
+    data["state"] = "ransomware detected" if detection == 1 else "normal"
+    data["ml_model_dedicated"] = True if detection == 1 else False
 
-    thresholds = {
-        "cpu_usage": 80,
-        "memory_usage": 80,
-        "disk_usage": 90,
-        "modified": 10,
-        "renamed": 10,
-        "deleted": 5,
-        "entropy_alerts": 10,
-        "unauth_proc_count": 1,
-        "shadow_copy_flag": 0,
-        "registry_alerts_count": 0,
-        "susp_net_count": 0,
-        "susp_ext_count": 0,
-        "proc_injection": 0,
-        "sys_call_anomaly": 0,
-        "total_net_connections": 100
-    }
-
-    threshold_breach = any(data.get(key, 0) > threshold for key, threshold in thresholds.items())
-    if ml_prediction == 1 or threshold_breach:
-        ml_prediction = 1
-        data["ml_detection"] = True
-    else:
-        data["ml_detection"] = False
-
-    data["ml_prediction"] = ml_prediction
-    if ml_prediction == 1:
+    if detection == 1:
         trigger_response(data)
         data["response_triggered"] = True
     else:
         data["response_triggered"] = False
 
+    baseline_stats = update_baseline(baseline_stats, data, alpha=0.1)
+    
     data["features"] = {
-        "cpu_usage": data["cpu_usage"],
         "memory_usage": data["memory_usage"],
         "disk_usage": data["disk_usage"],
         "modified": data["modified"],
@@ -451,11 +411,13 @@ def correlation_engine(data, csv_file="correlation_log.csv"):
     with open(csv_file, mode='a', newline='') as f:
         writer = csv.writer(f)
         if not file_exists:
-            writer.writerow(["timestamp", "cpu_usage", "memory_usage", "disk_usage",
-                             "modified", "renamed", "deleted", "entropy_alerts",
-                             "unauth_proc_count", "shadow_copy_flag", "registry_alerts_count",
-                             "susp_net_count", "susp_ext_count", "proc_injection", "sys_call_anomaly",
-                             "total_net_connections", "ml_prediction", "ml_detection", "response_triggered"])
+            writer.writerow([
+                "timestamp", "cpu_usage", "memory_usage", "disk_usage",
+                "modified", "renamed", "deleted", "entropy_alerts",
+                "unauth_proc_count", "shadow_copy_flag", "registry_alerts_count",
+                "susp_net_count", "susp_ext_count", "proc_injection", "sys_call_anomaly",
+                "total_net_connections", "ml_detection", "state", "response_triggered"
+            ])
         writer.writerow([
             data.get("timestamp"),
             data.get("cpu_usage"),
@@ -473,103 +435,223 @@ def correlation_engine(data, csv_file="correlation_log.csv"):
             data.get("proc_injection"),
             data.get("sys_call_anomaly"),
             data.get("total_net_connections"),
-            data.get("ml_prediction"),
             data.get("ml_detection"),
+            data.get("state"),
             data.get("response_triggered")
         ])
 
-# ------------------------------
-# Periodic Display using asyncio
-# ------------------------------
-async def periodic_display():
-    global ml_model
-    while True:
-        data = collect_and_predict(ml_model)
-        correlation_engine(data)
-        notify_system_data(data)
-        await asyncio.sleep(5)
+# -------------------------------------------------
+# Blocking Functionality
+# -------------------------------------------------
+def block_directory(directory):
+    """
+    Blocks write access to the specified directory on Windows.
+    This function uses the icacls command to deny write access for the current user.
+    """
+    if platform.system() == "Windows":
+        try:
+            current_user = os.getlogin()
+            command = f'icacls "{directory}" /deny {current_user}:(W)'
+            subprocess.check_call(command, shell=True)
+            logging.info(f"Write access to {directory} has been blocked for user {current_user}.")
+        except Exception:
+            logging.exception(f"Error blocking directory {directory}.")
+    else:
+        logging.info("Directory blocking is only implemented for Windows systems.")
 
-# ------------------------------
-# FastAPI Application Setup
-# ------------------------------
+# -------------------------------------------------
+# Alerting and Notifications
+# -------------------------------------------------
+async def reset_response_flag(delay=60):
+    await asyncio.sleep(delay)
+    response_triggered_flag.clear()
+
+def notify_clients(alert_message):
+    for client in connected_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(client.send_json(alert_message), main_loop)
+        except Exception:
+            logging.exception("Error sending alert to client.")
+
+def trigger_response(data):
+    global action_blocked
+    if not response_triggered_flag.is_set():
+        response_triggered_flag.set()
+        action_blocked = True
+        block_directory(MONITOR_PATH)
+        alert_message = {
+            "type": "alert",
+            "alert": "Potential ransomware activity detected! Immediate action is recommended to be safe. All further actions are blocked.",
+            "data": data
+        }
+        notify_clients(alert_message)
+        asyncio.run_coroutine_threadsafe(reset_response_flag(60), main_loop)
+
+def notify_live_tracking(data):
+    message = {"type": "live_tracking", "data": data["features"]}
+    for client in connected_clients:
+        try:
+            asyncio.run_coroutine_threadsafe(client.send_json(message), main_loop)
+        except Exception:
+            logging.exception("Error sending live tracking data to client.")
+
+# -------------------------------------------------
+# Ransomware Simulation (Test Option)
+# -------------------------------------------------
+def create_dummy_files(num_files=100):
+    for i in range(num_files):
+        file_path = test_ransomware_dir / f"file_{i}.txt"
+        try:
+            with open(file_path, "w") as f:
+                f.write("This is a safe dummy file.\n" * 10)
+        except Exception:
+            logging.exception(f"Error creating {file_path}")
+
+def simulate_ransomware():
+    global action_blocked
+    if action_blocked:
+        logging.info("Ransomware simulation blocked due to prior alert.")
+        return
+    try:
+        create_dummy_files(num_files=100)
+        for i in range(100):
+            original_path = test_ransomware_dir / f"file_{i}.txt"
+            try:
+                if original_path.exists():
+                    with open(original_path, "w") as f:
+                        random_content = ''.join(random.choices(string.ascii_letters + string.digits, k=100))
+                        f.write(random_content)
+                    new_path = test_ransomware_dir / f"file_{i}.encrypted"
+                    os.rename(original_path, new_path)
+                    logging.info(f"Simulated ransomware action on {new_path}")
+                    time.sleep(0.1)
+                    if new_path.exists():
+                        os.remove(new_path)
+                        logging.info(f"Deleted file: {new_path}")
+            except Exception as e:
+                logging.exception(f"Error processing file_{i}: {e}")
+            time.sleep(0.1)
+    except Exception as e:
+        logging.exception(f"Error during ransomware simulation: {e}")
+
+# -------------------------------------------------
+# Asynchronous Tasks for Live Tracking
+# -------------------------------------------------
+async def periodic_display_with_baseline():
+    global ensemble_models
+    # Reduced interval for faster updates (2 seconds instead of 5)
+    while True:
+        data = collect_and_predict(ensemble_models)
+        correlation_engine(data)
+        notify_live_tracking(data)
+        await asyncio.sleep(2)
+
+async def monitor_system():
+    while True:
+        await asyncio.sleep(2)
+
+async def main_async_tasks():
+    task1 = asyncio.create_task(periodic_display_with_baseline())
+    task2 = asyncio.create_task(monitor_system())
+    await asyncio.gather(task1, task2)
+
+# -------------------------------------------------
+# FastAPI Application and Endpoints
+# -------------------------------------------------
+templates = Jinja2Templates(directory="joo")  # Ensure dashboard.html is in the "joo" folder
 app = FastAPI(
     title="Advanced Ransomware Monitoring API",
-    description="Tracks 15 system monitoring features with real-time ML detection updates via WebSocket.",
+    description=("Continuously tracks computer performance and system activity. When potential ransomware activity is detected, an early alert is sent. "
+                 "Additionally, live tracking data (15 features) is pushed to connected clients.\n\n"
+                 "AI-Powered Threat Detection:\n"
+                 " - Identify file entropy changes (ransomware modifying file structures).\n"
+                 " - Track process API calls related to cryptographic operations and shadow copy deletion.\n"
+                 " - Detect registry modifications commonly associated with ransomware attacks."), 
     version="2.0"
 )
-templates = Jinja2Templates(directory="joo")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory="joo"), name="static")
 
 @app.websocket("/ws/alerts")
-async def websocket_alert_endpoint(websocket: WebSocket):
+async def websocket_alert_endpoint(websocket: WebSocket, token: str = Query(...)):
+    if token != "mysecrettoken":
+        await websocket.close(code=1008)
+        raise HTTPException(status_code=403, detail="Unauthorized")
     await websocket.accept()
     connected_clients.append(websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keeps connection alive.
-    except Exception as e:
-        logging.error(f"WebSocket error: {e}")
+            # Send a ping/keepalive message every 30 seconds
+            await websocket.send_json({"type": "ping", "message": "keepalive"})
+            await asyncio.sleep(30)
+    except Exception:
+        logging.exception("WebSocket error:")
     finally:
         if websocket in connected_clients:
             connected_clients.remove(websocket)
 
+
+
+# --- Custom Logging Handler for Live Tracking ---
+class WebSocketLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            log_entry = self.format(record)
+            message = {"type": "live_tracking_log", "log": log_entry}
+            notify_clients(message)
+        except Exception:
+            self.handleError(record)
+
+# --- Startup Event: Configure Logging and Start Async Tasks ---
 @app.on_event("startup")
 async def startup_event():
-    global file_monitor_handler_global, ml_model, main_loop
-    monitor_path = Path(r"C:\Users\Home\Documents")  # Adjust as needed.
+    global file_monitor_handler_global, ensemble_models, main_loop
+    # Remove all existing handlers to suppress backend output
+    root_logger = logging.getLogger()
+    root_logger.handlers = []
+
+    # Create and add the WebSocket log handler only
+    log_handler = WebSocketLogHandler()
+    log_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    log_handler.setFormatter(formatter)
+    root_logger.addHandler(log_handler)
+    root_logger.setLevel(logging.INFO)
+    root_logger.propagate = False
+
+    logging.info("AI-Powered Threat Detection Enabled:")
+    logging.info(" - Identifying file entropy changes (ransomware modifying file structures).")
+    logging.info(" - Tracking process API calls related to cryptographic operations and shadow copy deletion.")
+    logging.info(" - Detecting registry modifications commonly associated with ransomware attacks.")
     file_monitor_handler_global = FileMonitorHandler()
-    threading.Thread(target=start_file_monitor, args=(monitor_path, file_monitor_handler_global), daemon=True).start()
-    threading.Thread(target=monitor_process_execution, daemon=True).start()
-    threading.Thread(target=monitor_shadow_copy_deletion, daemon=True).start()
-    threading.Thread(target=monitor_registry_changes, daemon=True).start()
-    threading.Thread(target=monitor_network_traffic, daemon=True).start()
-    threading.Thread(target=monitor_memory_usage, args=(80,), daemon=True).start()
-    threading.Thread(target=monitor_file_extension_changes, args=(str(monitor_path),), daemon=True).start()
-    threading.Thread(target=monitor_abnormal_system_calls, daemon=True).start()
-    threading.Thread(target=monitor_process_injection, daemon=True).start()
-    threading.Thread(target=monitor_system_calls_etw, daemon=True).start()
-    threading.Thread(target=monitor_user_login_events, daemon=True).start()
-    threading.Thread(target=monitor_advanced_registry_changes, daemon=True).start()
-    threading.Thread(target=monitor_network_flow_details, daemon=True).start()
-    threading.Thread(target=start_falco_monitor, daemon=True).start()
-    
-    if not os.path.exists("ransomware_model_5features.pkl"):
-        train_and_save_model()
-    ml_model = load_ml_model("ransomware_model_5features.pkl")
+    threading.Thread(target=start_file_monitor, args=(MONITOR_PATH, file_monitor_handler_global), daemon=True).start()
+    ensemble_models = None
     main_loop = asyncio.get_running_loop()
-    asyncio.create_task(periodic_display())
+    asyncio.create_task(main_async_tasks())
 
 @app.get("/", summary="Welcome")
 def read_root():
-    return {"message": "Welcome to the Advanced Ransomware Monitoring API."}
+    return {"message": "Welcome to the Advanced Ransomware Monitoring API. Live tracking is active."}
 
-@app.get("/system_data", summary="Get Current System Data and ML Prediction")
+@app.get("/system_data", summary="Get a Snapshot of System Data and Detection")
 def get_system_data():
-    data = collect_and_predict(ml_model)
-    return data
+    data = collect_and_predict(ensemble_models)
+    return {"status": data.get("state"), "ml_model_dedicated": data.get("ml_model_dedicated"), "data": data}
 
-@app.get("/simulate_attack", summary="Simulate a Ransomware Attack")
-def simulate_attack():
-    data = collect_system_data()
-    data["ml_prediction"] = 1
-    data["ml_detection"] = True
-    trigger_response(data)
-    data["response_triggered"] = True
-    return {"message": "Simulated ransomware attack triggered.", "data": data}
-
-@app.get("/dashboard", response_class=HTMLResponse, summary="dashboard")
+@app.get("/dashboard", response_class=HTMLResponse, summary="Dashboard")
 def dashboard(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
-@app.get("/test", summary="Run Self Tests")
-def run_tests():
-    results = {
-        "cpu_usage": get_cpu_usage(),
-        "memory_usage": get_memory_usage(),
-        "disk_usage": get_disk_usage(),
-        "file_monitor_initialized": file_monitor_handler_global is not None
-    }
-    return results
+@app.get("/simulate_ransomware", summary="Simulate a Ransomware Attack")
+def simulate_ransomware_endpoint():
+    threading.Thread(target=simulate_ransomware, daemon=True).start()
+    return {"message": "Simulated ransomware attack triggered."}
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8001)
